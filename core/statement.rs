@@ -23,7 +23,7 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value, EXPLAIN_COLUMNS,
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
@@ -346,7 +346,16 @@ impl Statement {
             }
         }
 
-        *conn.schema.write() = conn.db.clone_schema();
+        // Only refresh the connection schema from the shared Database when we're NOT in
+        // a write transaction. During an explicit transaction (BEGIN...COMMIT), the connection's
+        // schema may already reflect uncommitted DDL changes (e.g., CREATE TABLE that set a new
+        // schema cookie via SetCookie) that haven't been propagated to the shared Database yet.
+        // Overwriting the connection schema with the stale shared DB schema would cause an
+        // infinite SchemaUpdated loop, since the reprepared statement would use the old cookie
+        // while the on-disk cookie has already advanced.
+        if matches!(conn.get_tx_state(), TransactionState::None) {
+            *conn.schema.write() = conn.db.clone_schema();
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;

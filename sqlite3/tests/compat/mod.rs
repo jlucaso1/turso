@@ -2613,4 +2613,136 @@ mod tests {
             sqlite3_free_table(ptr::null_mut());
         }
     }
+
+    /// Helper: prepare+step+finalize a single SQL statement, panic on failure.
+    unsafe fn exec_stmt(db: *mut sqlite3, sql: &std::ffi::CStr, label: &str) {
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+        assert_eq!(rc, SQLITE_OK, "{label}: prepare failed rc={rc}");
+        let rc = sqlite3_step(stmt);
+        assert!(
+            rc == SQLITE_DONE || rc == SQLITE_ROW,
+            "{label}: step failed rc={rc}"
+        );
+        assert_eq!(
+            sqlite3_finalize(stmt),
+            SQLITE_OK,
+            "{label}: finalize failed"
+        );
+    }
+
+    /// Helper: run SQL via sqlite3_exec, panic on failure.
+    unsafe fn exec_sql(db: *mut sqlite3, sql: &std::ffi::CStr, label: &str) {
+        let mut errmsg: *mut libc::c_char = ptr::null_mut();
+        let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+        if rc != SQLITE_OK {
+            let msg = if errmsg.is_null() {
+                "unknown".to_string()
+            } else {
+                let s = std::ffi::CStr::from_ptr(errmsg)
+                    .to_string_lossy()
+                    .to_string();
+                sqlite3_free(errmsg as *mut libc::c_void);
+                s
+            };
+            panic!("{label}: sqlite3_exec failed rc={rc}: {msg}");
+        }
+    }
+
+    /// Regression test for https://github.com/tursodatabase/turso/issues/5930
+    ///
+    /// Simulates Diesel's migration pattern: DDL via sqlite3_exec (batch_execute),
+    /// DML via sqlite3_prepare_v2+step (query builder), in BEGIN/COMMIT transactions.
+    /// After migrations, a cached (pre-prepared) statement must still work via reprepare.
+    #[test]
+    fn test_schema_cookie_stays_in_sync_after_multiple_ddl() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Create schema_migrations table via exec (like Diesel's batch_execute)
+            exec_sql(
+                db,
+                c"CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, run_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+                "create migrations table",
+            );
+
+            // Prepare a cached INSERT statement BEFORE migrations run.
+            // Diesel's statement cache does this — it prepares statements on first
+            // use and reuses them across schema changes. This statement is compiled
+            // with an early schema cookie that will be stale after migrations.
+            let mut cached_insert: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO schema_migrations (version) VALUES (?)".as_ptr(),
+                    -1,
+                    &mut cached_insert,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "prepare cached INSERT failed"
+            );
+
+            // Run 10 migrations, each in its own BEGIN/COMMIT.
+            for i in 0..10 {
+                exec_sql(db, c"BEGIN", &format!("begin migration {i}"));
+
+                // DDL via sqlite3_exec (Diesel's batch_execute for migration SQL)
+                let create_sql = std::ffi::CString::new(format!(
+                    "CREATE TABLE t{i} (id INTEGER PRIMARY KEY, val TEXT, extra INTEGER DEFAULT 0)"
+                ))
+                .unwrap();
+                exec_sql(db, &create_sql, &format!("create table t{i}"));
+
+                // DML via the CACHED statement (Diesel reuses prepared statements)
+                let version = std::ffi::CString::new(format!("000{i}")).unwrap();
+                assert_eq!(sqlite3_reset(cached_insert), SQLITE_OK);
+                assert_eq!(
+                    sqlite3_bind_text(
+                        cached_insert,
+                        1,
+                        version.as_ptr(),
+                        -1,
+                        None, // SQLITE_STATIC
+                    ),
+                    SQLITE_OK,
+                    "bind version for migration {i}"
+                );
+                let rc = sqlite3_step(cached_insert);
+                assert!(
+                    rc == SQLITE_DONE || rc == SQLITE_ROW,
+                    "cached INSERT during migration {i} failed rc={rc}"
+                );
+
+                exec_sql(db, c"COMMIT", &format!("commit migration {i}"));
+            }
+
+            assert_eq!(sqlite3_finalize(cached_insert), SQLITE_OK);
+
+            // After all migrations, a freshly prepared query must also work
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT val FROM t0".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK,
+                "prepare SELECT after migrations failed"
+            );
+            let rc = sqlite3_step(stmt);
+            assert_eq!(
+                rc, SQLITE_DONE,
+                "SELECT after migrations must succeed, got rc={rc}"
+            );
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }
