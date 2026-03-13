@@ -1612,7 +1612,10 @@ pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const f
         return std::ptr::null();
     }
     let v = &*(value as *const ExtValue);
-    match v.to_blob() {
+    // Use blob_ref() to get a reference to the underlying data without copying.
+    // The previous code used to_blob() which returns a temporary Vec<u8>;
+    // calling .as_ptr() on that Vec produced a dangling pointer (use-after-free).
+    match v.blob_ref() {
         Some(b) => b.as_ptr() as *const ffi::c_void,
         None => std::ptr::null(),
     }
@@ -1626,7 +1629,7 @@ pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_
     let v = &*(value as *const ExtValue);
     match v.value_type() {
         turso_ext::ValueType::Text => v.to_text().map(|s| s.len()).unwrap_or(0) as ffi::c_int,
-        turso_ext::ValueType::Blob => v.to_blob().map(|b| b.len()).unwrap_or(0) as ffi::c_int,
+        turso_ext::ValueType::Blob => v.blob_ref().map(|b| b.len()).unwrap_or(0) as ffi::c_int,
         _ => 0,
     }
 }
