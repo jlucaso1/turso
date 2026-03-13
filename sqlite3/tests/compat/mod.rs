@@ -168,6 +168,7 @@ extern "C" {
         flags: i32,
         z_vfs: *const libc::c_char,
     ) -> i32;
+    fn sqlite3_initialize() -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -3358,6 +3359,23 @@ mod tests {
                 db_path.exists(),
                 "file: URI with path should create a real database file"
             );
+        }
+    }
+
+    /// Test: sqlite3_initialize must not panic when a global tracing subscriber
+    /// is already installed. Previously, it called tracing_subscriber::fmt::init()
+    /// which panics if a subscriber exists, poisoning the Once and aborting on
+    /// all subsequent calls (since sqlite3_initialize is extern "C").
+    #[test]
+    fn test_sqlite3_initialize_no_panic_with_existing_subscriber() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        unsafe {
+            let rc = sqlite3_initialize();
+            assert_eq!(rc, SQLITE_OK);
+
+            let rc2 = sqlite3_initialize();
+            assert_eq!(rc2, SQLITE_OK);
         }
     }
 }
