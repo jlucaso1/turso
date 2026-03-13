@@ -3074,9 +3074,7 @@ mod tests {
             if data == expected {
                 sqlite3_result_int64(ctx, 1); // match
             } else {
-                eprintln!(
-                    "blob mismatch: expected {expected:?}, got {data:?}"
-                );
+                eprintln!("blob mismatch: expected {expected:?}, got {data:?}");
                 sqlite3_result_int64(ctx, 0); // corrupted data
             }
         }
@@ -3132,13 +3130,7 @@ mod tests {
             );
             let blob_data: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
             assert_eq!(
-                sqlite3_bind_blob(
-                    stmt,
-                    1,
-                    blob_data.as_ptr() as *const libc::c_void,
-                    4,
-                    None,
-                ),
+                sqlite3_bind_blob(stmt, 1, blob_data.as_ptr() as *const libc::c_void, 4, None,),
                 SQLITE_OK
             );
             assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
@@ -3376,6 +3368,114 @@ mod tests {
 
             let rc2 = sqlite3_initialize();
             assert_eq!(rc2, SQLITE_OK);
+        }
+    }
+
+    /// Test: Concurrent writes from two connections sharing the same database
+    /// must return SQLITE_BUSY, not crash/panic.
+    ///
+    /// Turso panics with `! self.db_initialized()` assertion in allocate_page1
+    /// when two connections race on a shared Database. Real SQLite returns
+    /// SQLITE_BUSY which the caller can retry.
+    #[test]
+    fn test_concurrent_write_returns_busy_not_panic() {
+        use std::sync::{Arc, Barrier};
+
+        unsafe {
+            // Use a shared in-memory URI — this is the pattern that triggers
+            // the pager assertion crash in Turso when two connections race.
+            let uri = c"file:concurrent_busy_mem?mode=memory&cache=shared";
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+
+            // Setup: create table (keep connection open to maintain shared cache)
+            let mut db_setup: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(
+                sqlite3_open_v2(uri.as_ptr(), &mut db_setup, flags, ptr::null()),
+                SQLITE_OK
+            );
+            let mut errmsg_setup: *mut libc::c_char = ptr::null_mut();
+            assert_eq!(
+                sqlite3_exec(
+                    db_setup,
+                    c"PRAGMA journal_mode = WAL".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg_setup
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db_setup,
+                    c"CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    &mut errmsg_setup
+                ),
+                SQLITE_OK
+            );
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            // Two threads open the same URI and try to write concurrently.
+            // The key requirement: neither should panic. One may get SQLITE_BUSY.
+            let mut handles = vec![];
+            for thread_id in 0..2 {
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut db: *mut sqlite3 = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_open_v2(uri.as_ptr(), &mut db, flags, ptr::null()),
+                        SQLITE_OK
+                    );
+
+                    let mut errmsg: *mut libc::c_char = ptr::null_mut();
+                    // Set a short busy timeout so we don't block forever
+                    assert_eq!(
+                        sqlite3_exec(
+                            db,
+                            c"PRAGMA busy_timeout = 1000".as_ptr(),
+                            None,
+                            ptr::null_mut(),
+                            &mut errmsg
+                        ),
+                        SQLITE_OK
+                    );
+
+                    barrier.wait();
+
+                    let mut busy_count = 0;
+                    let mut ok_count = 0;
+
+                    for i in 0..50 {
+                        let sql = format!(
+                            "INSERT INTO t1 VALUES ({}, 'thread{thread_id}_row{i}')",
+                            thread_id * 1000 + i
+                        );
+                        let sql_c = std::ffi::CString::new(sql).unwrap();
+                        let rc =
+                            sqlite3_exec(db, sql_c.as_ptr(), None, ptr::null_mut(), &mut errmsg);
+                        match rc {
+                            0 => ok_count += 1,   // SQLITE_OK
+                            5 => busy_count += 1, // SQLITE_BUSY
+                            _ => panic!("thread {thread_id} got unexpected rc={rc} on insert {i}"),
+                        }
+                    }
+
+                    assert_eq!(sqlite3_close(db), SQLITE_OK);
+                    (thread_id, ok_count, busy_count)
+                }));
+            }
+
+            for h in handles {
+                let (tid, ok, busy) = h.join().expect(
+                    "thread panicked — concurrent write crashed instead of returning SQLITE_BUSY",
+                );
+                eprintln!("thread {tid}: {ok} ok, {busy} busy");
+                assert!(ok > 0, "thread {tid} never succeeded");
+            }
+
+            assert_eq!(sqlite3_close(db_setup), SQLITE_OK);
         }
     }
 }
